@@ -9,6 +9,11 @@ from bson import ObjectId
 import asyncio
 import aiohttp
 import time
+import logging
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration
 MONGODB_URI = os.getenv('MONGODB_URI')
@@ -51,15 +56,25 @@ class APIResponse(BaseModel):
 
 # Authentication
 async def verify_api_key(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    """Verify API key from Authorization header"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
     
-    api_key = authorization.replace("Bearer ", "")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format. Use 'Bearer YOUR_KEY'")
     
+    api_key = authorization.replace("Bearer ", "").strip()
+    
+    logger.info(f"Checking API key: {api_key[:20]}...")
+    
+    # Find the API key in database
     key_doc = await api_keys_collection.find_one({'api_key': api_key, 'active': True})
     
     if not key_doc:
+        logger.warning(f"Invalid or inactive API key attempted: {api_key[:20]}...")
         raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+    
+    logger.info(f"Valid API key for user: {key_doc['user_id']}")
     
     # Update last used and request count
     await api_keys_collection.update_one(
@@ -87,6 +102,14 @@ async def check_website(url: str):
                     'checked_at': datetime.utcnow(),
                     'error': None
                 }
+    except asyncio.TimeoutError:
+        return {
+            'status': 'down',
+            'status_code': 0,
+            'response_time': int((time.time() - start_time) * 1000),
+            'checked_at': datetime.utcnow(),
+            'error': 'Timeout'
+        }
     except Exception as e:
         return {
             'status': 'down',
@@ -102,12 +125,28 @@ async def root():
     return {
         "name": "Uptime Monitor API",
         "version": "1.0.0",
-        "docs": "/docs"
+        "docs": "/docs",
+        "status": "operational"
     }
 
 @app.get("/api/v1/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    """Health check endpoint"""
+    try:
+        # Test database connection
+        await db.command('ping')
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "database": "disconnected",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
 @app.post("/api/v1/websites", response_model=APIResponse)
 async def add_website(
@@ -158,6 +197,8 @@ async def add_website(
     
     result = await websites_collection.insert_one(website_data)
     website_data['_id'] = str(result.inserted_id)
+    website_data['added_at'] = website_data['added_at'].isoformat()
+    website_data['last_checked'] = website_data['last_checked'].isoformat()
     
     return APIResponse(
         success=True,
@@ -295,7 +336,8 @@ async def get_statistics(user_id: int = Depends(verify_api_key)):
                 'online_websites': 0,
                 'offline_websites': 0,
                 'average_uptime': 0,
-                'average_response_time': 0
+                'average_response_time': 0,
+                'total_checks': 0
             },
             message="No websites found"
         )
@@ -306,6 +348,7 @@ async def get_statistics(user_id: int = Depends(verify_api_key)):
     
     avg_uptime = sum(site.get('uptime_percentage', 100) for site in websites) / total_sites
     avg_response = sum(site.get('last_response_time', 0) for site in websites) / total_sites
+    total_checks = sum(site.get('total_checks', 0) for site in websites)
     
     stats = {
         'total_websites': total_sites,
@@ -313,6 +356,7 @@ async def get_statistics(user_id: int = Depends(verify_api_key)):
         'offline_websites': offline_sites,
         'average_uptime': round(avg_uptime, 2),
         'average_response_time': round(avg_response, 2),
+        'total_checks': total_checks,
         'generated_at': datetime.utcnow().isoformat()
     }
     
@@ -366,6 +410,9 @@ async def manual_check(
             }
         }
     )
+    
+    check_result['checked_at'] = check_result['checked_at'].isoformat()
+    check_result['uptime_percentage'] = round(uptime_percentage, 2)
     
     return APIResponse(
         success=True,
