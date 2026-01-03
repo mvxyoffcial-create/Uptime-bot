@@ -89,9 +89,11 @@ monitor = UptimeMonitor()
 
 async def generate_api_key(user_id: int) -> str:
     """Generate a unique API key for a user"""
-    api_key = secrets.token_urlsafe(32)
+    # Generate a secure random API key
+    api_key = f"uptm_{secrets.token_urlsafe(32)}"
     
-    await api_keys_collection.insert_one({
+    # Insert into database
+    result = await api_keys_collection.insert_one({
         'user_id': user_id,
         'api_key': api_key,
         'created_at': datetime.utcnow(),
@@ -100,6 +102,7 @@ async def generate_api_key(user_id: int) -> str:
         'active': True
     })
     
+    logger.info(f"Generated API key for user {user_id}: {api_key[:20]}...")
     return api_key
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -113,6 +116,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'user_id': user.id,
                 'username': user.username,
                 'first_name': user.first_name,
+                'last_updated': datetime.utcnow()
+            },
+            '$setOnInsert': {
                 'joined_at': datetime.utcnow()
             }
         },
@@ -129,7 +135,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     if user.id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton("📢 Broadcast", callback_data='broadcast')])
+        keyboard.append([
+            InlineKeyboardButton("👑 Admin Stats", callback_data='admin_stats'),
+            InlineKeyboardButton("📢 Broadcast", callback_data='broadcast')
+        ])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -308,6 +317,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await asyncio.sleep(0.05)
                 except Exception as e:
                     failed += 1
+                    logger.error(f"Failed to send to {user['user_id']}: {e}")
             
             await status_msg.edit_text(
                 f"📢 **Broadcast Complete!**\n\n"
@@ -324,6 +334,7 @@ async def monitor_website(website_id: str, user_id: int):
             site = await websites_collection.find_one({'_id': ObjectId(website_id)})
             
             if not site:
+                logger.info(f"Website {website_id} not found, stopping monitoring")
                 break
             
             result = await monitor.check_website(site['url'])
@@ -384,8 +395,8 @@ Your website is back!
                 
                 try:
                     await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Failed to send notification to {user_id}: {e}")
             
             await asyncio.sleep(site['interval_seconds'])
             
@@ -490,7 +501,7 @@ async def generate_new_api_key(update: Update, context: ContextTypes.DEFAULT_TYP
         f"✅ **API Key Generated!**\n\n"
         f"`{api_key}`\n\n"
         f"⚠️ Save this key securely!\n"
-        f"📖 Check /api_docs for usage instructions.",
+        f"📖 Check API Docs for usage instructions.",
         parse_mode='Markdown'
     )
 
@@ -556,6 +567,80 @@ GET /stats
     
     await query.message.reply_text(docs, parse_mode='Markdown')
 
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show admin statistics"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id not in ADMIN_IDS:
+        await query.message.reply_text("❌ Unauthorized")
+        return
+    
+    # Get all statistics
+    total_users = await users_collection.count_documents({})
+    total_websites = await websites_collection.count_documents({})
+    total_api_keys = await api_keys_collection.count_documents({'active': True})
+    
+    # Website statistics
+    all_websites = await websites_collection.find({}).to_list(None)
+    up_websites = sum(1 for site in all_websites if site['status'] == 'up')
+    down_websites = total_websites - up_websites
+    
+    # Calculate average uptime
+    if all_websites:
+        avg_uptime = sum(site.get('uptime_percentage', 100) for site in all_websites) / len(all_websites)
+        avg_response = sum(site.get('last_response_time', 0) for site in all_websites) / len(all_websites)
+        total_checks = sum(site.get('total_checks', 0) for site in all_websites)
+    else:
+        avg_uptime = 0
+        avg_response = 0
+        total_checks = 0
+    
+    # Get interval distribution
+    interval_distribution = {}
+    for site in all_websites:
+        interval = site.get('interval', 'unknown')
+        interval_distribution[interval] = interval_distribution.get(interval, 0) + 1
+    
+    # Format interval distribution
+    interval_text = "\n".join([f"   • {k}: {v} sites" for k, v in sorted(interval_distribution.items())])
+    
+    # Get recent users (last 7 days)
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    recent_users = await users_collection.count_documents({'joined_at': {'$gte': week_ago}})
+    
+    text = f"""
+👑 **Admin Statistics Dashboard**
+
+**👥 Users:**
+• Total Users: {total_users}
+• New (7 days): {recent_users}
+• Active API Keys: {total_api_keys}
+
+**🌐 Websites:**
+• Total Monitored: {total_websites}
+• 🟢 Online: {up_websites}
+• 🔴 Offline: {down_websites}
+• Total Checks: {total_checks:,}
+
+**📊 Performance:**
+• Avg Uptime: {avg_uptime:.2f}%
+• Avg Response: {avg_response:.0f}ms
+
+**⏱️ Interval Distribution:**
+{interval_text if interval_text else '   No data'}
+
+**🕒 Generated:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Refresh", callback_data='admin_stats')],
+        [InlineKeyboardButton("🔙 Back", callback_data='back_to_menu')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button callbacks"""
     query = update.callback_query
@@ -576,6 +661,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_command(update, context)
     elif query.data == 'broadcast':
         await broadcast_start(update, context)
+    elif query.data == 'admin_stats':
+        await admin_stats(update, context)
     elif query.data.startswith('interval_'):
         interval_key = query.data.replace('interval_', '')
         await handle_interval_selection(update, context, interval_key)
@@ -587,6 +674,8 @@ async def start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
+    user = query.from_user
+    
     keyboard = [
         [InlineKeyboardButton("➕ Add Website", callback_data='add_website')],
         [InlineKeyboardButton("📊 My Websites", callback_data='list_websites')],
@@ -595,6 +684,12 @@ async def start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📖 API Docs", callback_data='api_docs'),
          InlineKeyboardButton("ℹ️ Help", callback_data='help')]
     ]
+    
+    if user.id in ADMIN_IDS:
+        keyboard.append([
+            InlineKeyboardButton("👑 Admin Stats", callback_data='admin_stats'),
+            InlineKeyboardButton("📢 Broadcast", callback_data='broadcast')
+        ])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -622,6 +717,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     avg_uptime = sum(site.get('uptime_percentage', 100) for site in websites) / total_sites
     avg_response = sum(site.get('last_response_time', 0) for site in websites) / total_sites
+    total_checks = sum(site.get('total_checks', 0) for site in websites)
     
     text = f"""
 📈 **Your Statistics**
@@ -632,6 +728,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📊 Average Uptime: {avg_uptime:.2f}%
 ⚡ Avg Response: {avg_response:.0f}ms
+🔍 Total Checks: {total_checks:,}
 
 🕒 Updated: {datetime.utcnow().strftime('%H:%M UTC')}
 """
