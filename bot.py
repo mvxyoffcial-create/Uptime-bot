@@ -513,7 +513,7 @@ async def show_api_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     docs = """
 📖 **API Documentation**
 
-**Base URL:** `https://your-api.com/api/v1`
+**Base URL:** `https://uptime-api-e0zw.onrender.com/api/v1`
 
 **Authentication:**
 Include your API key in the header:
